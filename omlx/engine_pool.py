@@ -75,6 +75,9 @@ class EngineEntry:
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
     actual_size: int | None = None  # Observed process-memory delta after load settles
+    admitted_size: int | None = None  # Resident size used at admission (streaming/
+    # text-only aware); accounting and the settle barrier read it so a model
+    # that never loads its full checkpoint is not booked at checkpoint size
     config_model_type: str = (
         ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     )
@@ -900,6 +903,56 @@ class EnginePool:
             ):
                 admission_size = entry.text_only_size
 
+            # SSD expert streaming (streamlx): the checkpoint never becomes
+            # fully resident — admit by trunk + pool budget, the same way
+            # text_only_size admits VLM checkpoints by their language
+            # weights. Expert stacks live under ".mlp.switch_mlp."; their
+            # bytes stream through a fixed-size pool instead of loading.
+            expert_stream_cfg = None
+            if self._settings_manager is not None:
+                _get_settings = getattr(
+                    self._settings_manager, "get_settings", None
+                )
+                if callable(_get_settings):
+                    _ms = _get_settings(model_id)
+                    expert_stream_cfg = getattr(_ms, "expert_stream", None)
+            if expert_stream_cfg:
+                try:
+                    from streamlx.stindex import SafetensorsIndex
+
+                    _idx = SafetensorsIndex(entry.model_path)
+                    _expert_bytes = sum(
+                        loc.nbytes
+                        for name, loc in _idx.tensors.items()
+                        if ".mlp.switch_mlp." in name
+                    )
+                    _budget = int(
+                        float(expert_stream_cfg.get("budget_gb", 12))
+                        * (1 << 30)
+                    )
+                    _streaming_size = (
+                        entry.estimated_size - _expert_bytes
+                    ) + _budget
+                    if 0 < _streaming_size < admission_size:
+                        logger.info(
+                            "expert_stream: admitting %s by trunk+pool "
+                            "estimate %s instead of checkpoint size %s",
+                            model_id,
+                            format_size(_streaming_size),
+                            format_size(admission_size),
+                        )
+                        admission_size = _streaming_size
+                except Exception:
+                    logger.warning(
+                        "expert_stream: streaming admission estimate "
+                        "failed; using checkpoint size",
+                        exc_info=True,
+                    )
+
+            # Remember what this load was admitted at so unload accounting
+            # and the settle barrier expect the same number.
+            entry.admitted_size = admission_size
+
             ceiling = self._current_ceiling()
             best_effort = False
             if ceiling <= 0:
@@ -1495,8 +1548,11 @@ class EnginePool:
         # Scale tolerance with model size: estimated_size includes a 5%
         # overhead factor (model_discovery.py) that may not be reflected in
         # actual freed memory. Use 2 GB floor for small models. See #768.
-        settle_tolerance = max(2 * 1024**3, int(entry.estimated_size * 0.05))
-        min_expected_freed = max(0, entry.estimated_size - settle_tolerance)
+        # A streaming/text-only load only ever held admitted_size, so expect
+        # that much back, not the checkpoint size.
+        _resident_size = entry.admitted_size or entry.estimated_size
+        settle_tolerance = max(2 * 1024**3, int(_resident_size * 0.05))
+        min_expected_freed = max(0, _resident_size - settle_tolerance)
         settled = False
         settle_indeterminate = False
         for _settle_round in range(10):
@@ -1539,7 +1595,7 @@ class EnginePool:
             )
 
         # Release memory tracking AFTER barrier
-        self._current_model_memory -= entry.estimated_size
+        self._current_model_memory -= entry.admitted_size or entry.estimated_size
 
         if settled:
             logger.info(
@@ -1964,7 +2020,7 @@ class EnginePool:
             self._validate_llm_engine_ready(model_id, engine)
             entry.engine = engine
             entry.last_access = time.time()
-            self._current_model_memory += entry.estimated_size
+            self._current_model_memory += entry.admitted_size or entry.estimated_size
             load_completed = True
             self._clear_load_failure(entry)
 
