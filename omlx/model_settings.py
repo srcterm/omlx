@@ -109,6 +109,8 @@ class ModelSettings:
         turboquant_kv_enabled: Enable TurboQuant KV cache compression.
         turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
+        expert_stream: SSD expert streaming for >RAM MoE models (streamlx):
+            {"budget_gb": float, "warmstart_trace": str|None}; None = disabled.
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -262,6 +264,12 @@ class ModelSettings:
     vlm_mtp_draft_block_size: Optional[int] = (
         None  # Tokens per draft round (None = mlx-vlm default)
     )
+
+    # SSD expert streaming (streamlx): stream MoE expert weights from disk
+    # through a fixed-budget LRU pool instead of loading them resident.
+    # Dict {"budget_gb": float, "warmstart_trace": str|None}; None = disabled
+    # (stock eager load). Requires the optional `streamlx` package.
+    expert_stream: Optional[Dict[str, Any]] = None
 
     # Model management flags
     is_pinned: bool = False
