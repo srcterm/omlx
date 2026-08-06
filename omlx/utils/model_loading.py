@@ -1024,3 +1024,68 @@ def maybe_load_custom_quantization(
         return None
 
     return model, processor
+
+
+def maybe_load_expert_streaming(
+    model_name: str,
+    model_settings: Any = None,
+    *,
+    tokenizer_config: dict | None = None,
+    trust_remote_code: bool = False,
+) -> tuple[Any, Any] | None:
+    """Load a MoE model with SSD expert streaming when settings request it.
+
+    Gated on ``model_settings.expert_stream`` (a dict; None/empty = off).
+    Loads the trunk with mlx-lm ``lazy=True`` and replaces every MoE layer's
+    ``switch_mlp`` with a fixed-budget LRU expert pool that preads expert
+    weights from the model's safetensors on miss — the model never becomes
+    fully resident, which is the point: this path exists for models larger
+    than RAM, where the eager loader is not survivable.
+
+    Returns ``(model, tokenizer)`` or ``None`` when streaming is not
+    configured. Must run before the eager load; pools are materialized on
+    the calling (loader) thread so inference threads only see real buffers.
+    """
+    cfg = getattr(model_settings, "expert_stream", None)
+    if not cfg:
+        return None
+
+    try:
+        from streamlx.integrate import load_streaming_model, preload_popular
+    except ImportError as e:
+        raise ImportError(
+            "expert_stream is configured for this model but the streamlx "
+            "package is not installed in the omlx environment"
+        ) from e
+
+    budget_gb = float(cfg.get("budget_gb", 12))
+    budget_bytes = int(budget_gb * (1 << 30))
+    model, tokenizer, pools, reader = load_streaming_model(
+        model_name,
+        budget_bytes,
+        trust_remote_code=trust_remote_code,
+        tokenizer_config=tokenizer_config,
+    )
+    logger.info(
+        "expert_stream: %s loaded with %.1f GiB pool budget across %d MoE "
+        "layers (trunk resident, experts pread on miss)",
+        model_name,
+        budget_gb,
+        len(pools),
+    )
+
+    trace = cfg.get("warmstart_trace")
+    if trace:
+        try:
+            n = preload_popular(pools, trace)
+            logger.info(
+                "expert_stream: warm-started %d experts from %s", n, trace
+            )
+        except Exception:
+            logger.warning(
+                "expert_stream: warm-start from %s failed; continuing cold",
+                trace,
+                exc_info=True,
+            )
+
+    return model, tokenizer

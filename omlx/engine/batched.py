@@ -238,6 +238,7 @@ class BatchedEngine(BaseEngine):
             lm_load_compat,
             maybe_apply_pre_load_patches,
             maybe_load_custom_quantization,
+            maybe_load_expert_streaming,
         )
 
         # Build tokenizer config with model-specific fixes
@@ -259,6 +260,17 @@ class BatchedEngine(BaseEngine):
         from ..engine_core import get_mlx_executor
 
         def _load_model_sync():
+            # SSD expert streaming must branch before the eager loader: for
+            # a >RAM MoE model the eager path is what fails, not a fallback.
+            streaming_loaded = maybe_load_expert_streaming(
+                self._model_name,
+                self._model_settings,
+                tokenizer_config=tokenizer_config,
+                trust_remote_code=self._trust_remote_code,
+            )
+            if streaming_loaded is not None:
+                return streaming_loaded
+
             custom_loaded = maybe_load_custom_quantization(
                 self._model_name,
                 is_vlm=False,
@@ -419,6 +431,16 @@ class BatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        # Continuous batching multiplies the per-step expert working set,
+        # which collapses streaming-pool hit rates; recommend batch-1.
+        if getattr(self._model_settings, "expert_stream", None):
+            _seqs = getattr(scheduler_config, "max_num_seqs", 1)
+            if _seqs and _seqs > 1:
+                logger.warning(
+                    "expert_stream: max_concurrent_requests=1 is recommended "
+                    "for streaming models (scheduler currently allows %d)",
+                    _seqs,
+                )
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,
